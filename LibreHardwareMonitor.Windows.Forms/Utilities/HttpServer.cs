@@ -654,7 +654,11 @@ public class HttpServer
                     gpu ??= hardwareNode;
                     break;
                 case HardwareType.Memory:
-                    ram ??= hardwareNode;
+                    // 物理内存（Total Memory，/ram）和虚拟内存（Virtual Memory，/vram）同为 Memory 类型，
+                    // 默认取第一个会拿到虚拟内存，这里优先选择 /ram。
+                    if (ram == null ||
+                        string.Equals(hardwareNode.Hardware.Identifier.ToString(), "/ram", StringComparison.OrdinalIgnoreCase))
+                        ram = hardwareNode;
                     break;
             }
         }
