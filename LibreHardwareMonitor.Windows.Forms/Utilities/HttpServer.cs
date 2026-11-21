@@ -27,10 +27,25 @@ namespace LibreHardwareMonitor.Windows.Forms.Utilities;
 
 public class HttpServer
 {
+    // Default interval between two /events pushes and the interval of the keep-alive comments.
+    private const int DefaultSseIntervalMs = 1000;
+    private const int MinSseIntervalMs = 100;
+    private const int MaxSseIntervalMs = 60000;
+    private const int SseHeartbeatMs = 15000;
+    private const int SseRetryMs = 3000;
+
+    private static readonly System.Text.Json.JsonSerializerOptions DataJsonOptions = new()
+    {
+        NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowNamedFloatingPointLiterals, // Allow "NaN"
+    };
+
     private readonly HttpListener _listener;
     private readonly Node _root;
     private readonly IElement _rootElement;
     private readonly Version _version = typeof(HttpServer).Assembly.GetName().Version;
+
+    private readonly object _sseClientsLock = new();
+    private readonly List<HttpListenerResponse> _sseClients = new();
 
     private Task _listenerTask;
     private CancellationTokenSource _cts;
@@ -47,7 +62,8 @@ public class HttpServer
 
         try
         {
-            _listener = new HttpListener { IgnoreWriteExceptions = true };
+            // Write failures are surfaced so long-lived streams can detect that the client is gone.
+            _listener = new HttpListener { IgnoreWriteExceptions = false };
         }
         catch (PlatformNotSupportedException)
         {
@@ -125,7 +141,8 @@ public class HttpServer
             _listener.Start();
 
             _cts = new CancellationTokenSource();
-            _listenerTask = Task.Run(() => ProcessRequestsAsync(_cts.Token));
+            CancellationToken token = _cts.Token;
+            _listenerTask = Task.Run(() => ProcessRequestsAsync(token), token);
         }
         catch (Exception)
         {
@@ -143,6 +160,7 @@ public class HttpServer
         try
         {
             _cts?.Cancel();
+            AbortSseClients(); // unblock pending writes of open /events streams
             _listenerTask?.Wait(TimeSpan.FromSeconds(5)); // Graceful wait
             _listener?.Stop();
             _cts?.Dispose();
@@ -166,7 +184,7 @@ public class HttpServer
             try
             {
                 var context = await _listener.GetContextAsync();
-                _ = Task.Run(() => HandleContextAsync(context), cancellationToken);
+                _ = Task.Run(() => HandleContextAsync(context, cancellationToken), cancellationToken);
             }
             catch (HttpListenerException ex) when (ex.ErrorCode == 50)
             {
@@ -384,7 +402,7 @@ public class HttpServer
         return System.Text.Json.JsonSerializer.Serialize(result);
     }
 
-    private async Task HandleContextAsync(HttpListenerContext context)
+    private async Task HandleContextAsync(HttpListenerContext context, CancellationToken cancellationToken)
     {
         HttpListenerRequest request = context.Request;
         bool authenticated = true;
@@ -428,6 +446,12 @@ public class HttpServer
                         if (requestedFile == "data.json")
                         {
                             await SendJsonAsync(context.Response, request);
+                            return;
+                        }
+
+                        if (requestedFile == "events" || requestedFile.StartsWith("events?", StringComparison.Ordinal))
+                        {
+                            await SendEventStreamAsync(context.Response, request, cancellationToken);
                             return;
                         }
 
@@ -568,7 +592,15 @@ public class HttpServer
                 catch (HttpListenerException)
                 { }
 
-                response.Close();
+                try
+                {
+                    response.Close();
+                }
+                catch
+                {
+                    // client closed connection before the content was sent
+                }
+
                 return;
             }
         }
@@ -577,7 +609,9 @@ public class HttpServer
         response.Close();
     }
 
-    private async Task SendJsonAsync(HttpListenerResponse response, HttpListenerRequest request = null)
+    // Builds the exact same JSON document that /data.json returns.
+    // It is shared by /data.json and /events so both endpoints always stay in sync.
+    private string GenerateDataJson()
     {
         Dictionary<string, object> json = new();
 
@@ -593,13 +627,12 @@ public class HttpServer
 
         json["Children"] = new List<object> { GenerateJsonForNode(_root, ref nodeIndex) };
 
-        byte[] buffer = Encoding.UTF8.GetBytes(System.Text.Json.JsonSerializer.Serialize(
-            json,
-            new System.Text.Json.JsonSerializerOptions
-            {
-                NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowNamedFloatingPointLiterals, // Allow "NaN"
-            }
-        ));
+        return System.Text.Json.JsonSerializer.Serialize(json, DataJsonOptions);
+    }
+
+    private async Task SendJsonAsync(HttpListenerResponse response, HttpListenerRequest request = null)
+    {
+        byte[] buffer = Encoding.UTF8.GetBytes(GenerateDataJson());
 
         bool acceptGzip;
         try
@@ -634,8 +667,164 @@ public class HttpServer
         catch (HttpListenerException)
         { }
 
-        response.Close();
+        try
+        {
+            response.Close();
+        }
+        catch
+        {
+            // client closed connection before the content was sent
+        }
     }
+
+    // Handles "/events" requests: a Server-Sent Events stream that pushes the same
+    // JSON document as /data.json on every interval, so a client connects once and
+    // keeps receiving the full tree until it disconnects or the server stops.
+    //
+    // http://localhost:8085/events            -> push every 1000 ms
+    // http://localhost:8085/events?interval=500
+    //
+    // Every message uses the default "message" event, so the client side is simply:
+    //   const source = new EventSource('http://localhost:8085/events');
+    //   source.onmessage = e => console.log(JSON.parse(e.data));
+    private async Task SendEventStreamAsync(HttpListenerResponse response, HttpListenerRequest request, CancellationToken cancellationToken)
+    {
+        int interval = ParseSseInterval(request);
+
+        response.StatusCode = 200;
+        response.SendChunked = true;
+        response.ContentType = "text/event-stream";
+        response.AddHeader("Cache-Control", "no-cache");
+        response.AddHeader("Access-Control-Allow-Origin", "*");
+        response.AddHeader("X-Accel-Buffering", "no"); // disable proxy buffering
+        response.KeepAlive = true;
+
+        RegisterSseClient(response);
+
+        try
+        {
+            // Initial comment opens the stream immediately and tells the browser how fast to reconnect.
+            await WriteSseAsync(response, ": connected\nretry: " + SseRetryMs + "\n\n", cancellationToken);
+
+            long eventId = 0;
+            while (!cancellationToken.IsCancellationRequested && _listener.IsListening)
+            {
+                string json = GenerateDataJson();
+
+                // A data field must not contain a bare CR/LF; the serializer emits a single line,
+                // but keep the framing defensive in case the document is ever pretty-printed.
+                var frame = new StringBuilder();
+                frame.Append("id: ").Append(eventId++).Append('\n');
+                foreach (string line in json.Split('\n'))
+                {
+                    frame.Append("data: ").Append(line.TrimEnd('\r')).Append('\n');
+                }
+                frame.Append('\n');
+
+                await WriteSseAsync(response, frame.ToString(), cancellationToken);
+
+                // Wait for the next push, emitting keep-alive comments on long intervals.
+                int remaining = interval;
+                while (remaining > 0 && !cancellationToken.IsCancellationRequested)
+                {
+                    int slice = Math.Min(remaining, SseHeartbeatMs);
+                    await Task.Delay(slice, cancellationToken);
+                    remaining -= slice;
+
+                    if (remaining > 0)
+                        await WriteSseAsync(response, ": ping\n\n", cancellationToken);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        { }
+        catch (HttpListenerException)
+        {
+            // client closed the connection
+        }
+        catch (IOException)
+        {
+            // client closed the connection
+        }
+        catch (ObjectDisposedException)
+        {
+            // server stopped
+        }
+        catch (InvalidOperationException)
+        {
+            // response already closed
+        }
+        finally
+        {
+            UnregisterSseClient(response);
+            try
+            {
+                response.Close();
+            }
+            catch
+            {
+                // already closed or aborted
+            }
+        }
+    }
+
+    private static int ParseSseInterval(HttpListenerRequest request)
+    {
+        int interval = DefaultSseIntervalMs;
+        if (request != null && int.TryParse(request.QueryString["interval"], NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed))
+        {
+            interval = Math.Min(MaxSseIntervalMs, Math.Max(MinSseIntervalMs, parsed));
+        }
+
+        return interval;
+    }
+
+    private static async Task WriteSseAsync(HttpListenerResponse response, string text, CancellationToken cancellationToken)
+    {
+        byte[] buffer = Encoding.UTF8.GetBytes(text);
+        await response.OutputStream.WriteAsync(buffer, 0, buffer.Length, cancellationToken);
+        await response.OutputStream.FlushAsync(cancellationToken);
+    }
+
+    private void RegisterSseClient(HttpListenerResponse response)
+    {
+        lock (_sseClientsLock)
+        {
+            _sseClients.Add(response);
+        }
+    }
+
+    private void UnregisterSseClient(HttpListenerResponse response)
+    {
+        lock (_sseClientsLock)
+        {
+            _sseClients.Remove(response);
+        }
+    }
+
+    // Called when the server stops so open streams are interrupted instead of waiting for a write timeout.
+    private void AbortSseClients()
+    {
+        HttpListenerResponse[] clients;
+        lock (_sseClientsLock)
+        {
+            clients = _sseClients.ToArray();
+            _sseClients.Clear();
+        }
+
+        foreach (HttpListenerResponse client in clients)
+        {
+            try
+            {
+                client.Abort();
+            }
+            catch
+            {
+                // ignore, the stream is already gone
+            }
+        }
+    }
+
 
     private string GeneratePrometheusResponse(Node node, Dictionary<string, int> prometheusSettings)
     {
