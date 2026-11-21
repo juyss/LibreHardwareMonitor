@@ -630,6 +630,81 @@ public class HttpServer
         return System.Text.Json.JsonSerializer.Serialize(json, DataJsonOptions);
     }
 
+    // Compact payload for low-bandwidth clients (e.g. an ESP8266):
+    // only the values shown on the display, about 100 bytes instead of the full tree.
+    private string GenerateCompactJson()
+    {
+        HardwareNode cpu = null;
+        HardwareNode gpu = null;
+        HardwareNode ram = null;
+
+        foreach (Node child in _root.Nodes)
+        {
+            if (child is not HardwareNode hardwareNode)
+                continue;
+
+            switch (hardwareNode.Hardware.HardwareType)
+            {
+                case HardwareType.Cpu:
+                    cpu ??= hardwareNode;
+                    break;
+                case HardwareType.GpuAmd:
+                case HardwareType.GpuNvidia:
+                case HardwareType.GpuIntel:
+                    gpu ??= hardwareNode;
+                    break;
+                case HardwareType.Memory:
+                    ram ??= hardwareNode;
+                    break;
+            }
+        }
+
+        var payload = new
+        {
+            cpu = cpu?.Text ?? string.Empty,
+            ct = (int)(FindSensor(cpu, SensorType.Temperature, "Core Max")?.Sensor.Value ?? 0),
+            cl = (int)(FindSensor(cpu, SensorType.Load, "CPU Total")?.Sensor.Value ?? 0),
+            gpu = gpu?.Text ?? string.Empty,
+            gt = (int)(FindSensor(gpu, SensorType.Temperature, "GPU Core")?.Sensor.Value ?? 0),
+            gl = (int)(FindSensor(gpu, SensorType.Load, "GPU Core")?.Sensor.Value ?? 0),
+            ram = (int)(FindSensor(ram, SensorType.Load, null)?.Sensor.Value ?? 0)
+        };
+
+        return System.Text.Json.JsonSerializer.Serialize(payload);
+    }
+
+    private static SensorNode FindSensor(HardwareNode hardware, SensorType sensorType, string preferredName)
+    {
+        if (hardware == null)
+            return null;
+
+        SensorNode fallback = null;
+        foreach (SensorNode sensorNode in EnumerateSensors(hardware))
+        {
+            if (sensorNode.Sensor.SensorType != sensorType)
+                continue;
+
+            if (preferredName == null || sensorNode.Sensor.Name == preferredName)
+                return sensorNode;
+
+            fallback ??= sensorNode;
+        }
+
+        return fallback;
+    }
+
+    private static IEnumerable<SensorNode> EnumerateSensors(Node node)
+    {
+        foreach (Node child in node.Nodes)
+        {
+            if (child is SensorNode sensorNode)
+                yield return sensorNode;
+            else
+                foreach (SensorNode nested in EnumerateSensors(child))
+                    yield return nested;
+        }
+    }
+
     private async Task SendJsonAsync(HttpListenerResponse response, HttpListenerRequest request = null)
     {
         byte[] buffer = Encoding.UTF8.GetBytes(GenerateDataJson());
@@ -677,12 +752,14 @@ public class HttpServer
         }
     }
 
-    // Handles "/events" requests: a Server-Sent Events stream that pushes the same
-    // JSON document as /data.json on every interval, so a client connects once and
-    // keeps receiving the full tree until it disconnects or the server stops.
+    // Handles "/events" requests: a Server-Sent Events stream that pushes a snapshot
+    // on every interval, so a client connects once and keeps receiving data until it
+    // disconnects or the server stops. The default payload is the same JSON document
+    // as /data.json; format=compact sends only the values needed by the display.
     //
     // http://localhost:8085/events            -> push every 1000 ms
     // http://localhost:8085/events?interval=500
+    // http://localhost:8085/events?interval=500&format=compact  -> only the display values
     //
     // Every message uses the default "message" event, so the client side is simply:
     //   const source = new EventSource('http://localhost:8085/events');
@@ -690,6 +767,7 @@ public class HttpServer
     private async Task SendEventStreamAsync(HttpListenerResponse response, HttpListenerRequest request, CancellationToken cancellationToken)
     {
         int interval = ParseSseInterval(request);
+        bool compact = string.Equals(request.QueryString["format"], "compact", StringComparison.OrdinalIgnoreCase);
 
         response.StatusCode = 200;
         response.SendChunked = true;
@@ -709,12 +787,13 @@ public class HttpServer
             long eventId = 0;
             while (!cancellationToken.IsCancellationRequested && _listener.IsListening)
             {
-                string json = GenerateDataJson();
+                string json = compact ? GenerateCompactJson() : GenerateDataJson();
 
                 // A data field must not contain a bare CR/LF; the serializer emits a single line,
                 // but keep the framing defensive in case the document is ever pretty-printed.
                 var frame = new StringBuilder();
-                frame.Append("id: ").Append(eventId++).Append('\n');
+                if (!compact)
+                    frame.Append("id: ").Append(eventId++).Append('\n');
                 foreach (string line in json.Split('\n'))
                 {
                     frame.Append("data: ").Append(line.TrimEnd('\r')).Append('\n');

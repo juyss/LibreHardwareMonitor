@@ -6,3 +6,6 @@
 .vs/
 .vscode/
 packages/
+
+# ESP8266 本地密钥（参考 ESP8266/secrets.example.h）
+ESP8266/secrets.h
